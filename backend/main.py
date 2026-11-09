@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import hashlib
 import io
 import ipaddress
@@ -18,14 +20,19 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from config import (
     BASETEN_CHAT_MODEL_REQUIRED,
     META_CHAT_MODEL_DEFAULT,
     credit_shield,
+    resolve_public_rate_limit_per_hour,
     settings,
 )
 from pdf_builder import build_case_dossier_pdf, build_handover_pdf
@@ -60,6 +67,205 @@ CHAT_MODEL_DEFAULT = META_CHAT_MODEL_DEFAULT
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = STORAGE_DIR / "uploads"
+
+# ---------------------------------------------------------------------------
+# Ephemeral upload retention
+# ---------------------------------------------------------------------------
+
+UPLOAD_RETENTION_HOURS = 24.0
+UPLOAD_CLEANUP_INTERVAL_SECONDS = 3600.0
+
+
+def purge_expired_uploads(
+    max_age_hours: float = UPLOAD_RETENTION_HOURS,
+    uploads_dir: Path | None = None,
+    now: float | None = None,
+) -> int:
+    """Delete user uploads older than ``max_age_hours``; return the count.
+
+    Only files under ``backend/storage/uploads/`` are eligible: the walk
+    is rooted at that directory, so ``storage/samples/`` and
+    ``demo-assets/`` can never be reached. Empty job directories left
+    behind are removed too. Best-effort by design -- per-file errors are
+    swallowed so a locked or vanishing file can never break the cleanup
+    loop or app startup.
+    """
+    root = uploads_dir if uploads_dir is not None else UPLOADS_DIR
+    try:
+        root = root.resolve()
+    except OSError:
+        return 0
+    if not root.is_dir():
+        return 0
+    current = time.time() if now is None else now
+    cutoff = current - max_age_hours * 3600.0
+    deleted = 0
+    for path in sorted(root.rglob("*"), reverse=True):
+        try:
+            if path.is_file():
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    deleted += 1
+            elif path.is_dir() and path != root and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            continue
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Public-deployment per-IP rate limiting (opt-in)
+# ---------------------------------------------------------------------------
+#
+# Inert unless PUBLIC_RATE_LIMIT_PER_HOUR is set in the environment to a
+# positive integer (see config.resolve_public_rate_limit_per_hour). Only
+# the live provider-calling POST endpoints below are counted. Requests
+# whose uploaded file is byte-identical to a built-in demo asset (the
+# one-click sample cases) are exempt, and a counted request whose JSON
+# response reports a CreditShield cache serve ("cached": true) is
+# refunded -- sample and cache-served traffic never consumes quota.
+
+RATE_LIMITED_POST_PATHS = frozenset(
+    {
+        "/api/decode-contract",
+        "/api/draft-dispute",
+        "/api/segment-image",
+        "/api/process-walkthrough",
+        "/api/verify-moveout",
+    }
+)
+RATE_LIMIT_WINDOW_SECONDS = 3600.0
+_RATE_LIMIT_BODY_PARSE_MAX = 64 * 1024 * 1024
+
+_demo_asset_hashes_cache: set[str] | None = None
+
+
+def _demo_asset_hashes() -> set[str]:
+    """SHA-256 of every file under storage/samples/ and demo-assets/.
+
+    Computed lazily on first use and memoised; unreadable files are
+    skipped. Lets the rate limiter recognise one-click sample uploads
+    byte-for-byte instead of trusting a client-supplied flag.
+    """
+    global _demo_asset_hashes_cache
+    if _demo_asset_hashes_cache is None:
+        hashes: set[str] = set()
+        for folder in (STORAGE_DIR / "samples", BASE_DIR / "demo-assets"):
+            if not folder.is_dir():
+                continue
+            for path in folder.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    hashes.add(hashlib.sha256(path.read_bytes()).hexdigest())
+                except OSError:
+                    continue
+        _demo_asset_hashes_cache = hashes
+    return _demo_asset_hashes_cache
+
+
+async def _request_uploads_demo_asset(request: Request) -> bool:
+    """True when a multipart request's file part is a built-in demo asset."""
+    try:
+        form = await request.form()
+    except Exception:
+        return False
+    for value in form.values():
+        if isinstance(value, StarletteUploadFile):
+            try:
+                await value.seek(0)
+                data = await value.read()
+            except Exception:
+                return False
+            return hashlib.sha256(data).hexdigest() in _demo_asset_hashes()
+    return False
+
+
+class PublicRateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP hourly quota over the live provider-calling POST endpoints."""
+
+    def __init__(self, app: Any) -> None:
+        super().__init__(app)
+        self._hits: dict[str, collections.deque] = collections.defaultdict(
+            collections.deque
+        )
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        limit = resolve_public_rate_limit_per_hour()
+        if (
+            limit <= 0
+            or request.method != "POST"
+            or request.url.path not in RATE_LIMITED_POST_PATHS
+        ):
+            return await call_next(request)
+        # Demo-sample exemption. Reading the body here is safe:
+        # BaseHTTPMiddleware replays the cached body to the endpoint.
+        if request.headers.get("content-type", "").startswith(
+            "multipart/form-data"
+        ):
+            body = await request.body()
+            if 0 < len(body) <= _RATE_LIMIT_BODY_PARSE_MAX and (
+                await _request_uploads_demo_asset(request)
+            ):
+                return await call_next(request)
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        hits = self._hits[client_ip]
+        while hits and now - hits[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            hits.popleft()
+        if len(hits) >= limit:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": (
+                        "Public rate limit exceeded: at most "
+                        f"{limit} live requests per hour per IP on this "
+                        "deployment. The built-in sample cases stay "
+                        "available without limit; please retry later."
+                    ),
+                    "rate_limit_per_hour": limit,
+                },
+                headers={
+                    "Retry-After": str(int(RATE_LIMIT_WINDOW_SECONDS))
+                },
+            )
+        hits.append(now)
+        response = await call_next(request)
+        # Cache-serve refund: SAM-backed responses mark records served
+        # from the CreditShield cache with "cached": true; such a
+        # request made no provider call and must not consume quota.
+        if response.headers.get("content-type", "").startswith(
+            "application/json"
+        ):
+            chunks: list[bytes] = []
+            try:
+                async for chunk in response.body_iterator:
+                    chunks.append(
+                        chunk
+                        if isinstance(chunk, bytes)
+                        else chunk.encode("utf-8")
+                    )
+            except Exception:
+                pass
+            payload = b"".join(chunks)
+            if b'"cached": true' in payload or b'"cached":true' in payload:
+                try:
+                    hits.remove(now)
+                except ValueError:
+                    pass
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() != "content-length"
+            }
+            return Response(
+                content=payload,
+                status_code=response.status_code,
+                headers=headers,
+                media_type="application/json",
+            )
+        return response
 
 REVIEW_NOTE = (
     "Automated findings are preliminary and uncertain. "
@@ -67,6 +273,11 @@ REVIEW_NOTE = (
 )
 
 app = FastAPI(title="LeaseLens", version="0.1.0")
+
+# Registered before CORS so the CORS middleware stays outermost and its
+# headers also decorate the limiter's 429 responses. The limiter itself
+# is inert unless PUBLIC_RATE_LIMIT_PER_HOUR enables it.
+app.add_middleware(PublicRateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -371,6 +582,34 @@ def _warn_when_live_provider_has_no_key() -> None:
             "WARNING: Muse Voice and SAM 3.1 need META_API_KEY, "
             "which is not configured."
         )
+
+
+_upload_cleanup_task: asyncio.Task | None = None
+
+
+async def _upload_cleanup_loop() -> None:
+    """Purge expired uploads on startup and then hourly; never raises."""
+    while True:
+        try:
+            purge_expired_uploads()
+        except Exception as exc:  # the loop must survive any purge failure
+            print(f"WARNING: upload cleanup failed: {exc}")
+        await asyncio.sleep(UPLOAD_CLEANUP_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_upload_cleanup() -> None:
+    global _upload_cleanup_task
+    if _upload_cleanup_task is None or _upload_cleanup_task.done():
+        _upload_cleanup_task = asyncio.create_task(_upload_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_upload_cleanup() -> None:
+    global _upload_cleanup_task
+    if _upload_cleanup_task is not None:
+        _upload_cleanup_task.cancel()
+        _upload_cleanup_task = None
 
 
 def _reported_chat_model() -> str:
@@ -1967,20 +2206,32 @@ async def _segment_auto_candidates(
     except Exception:
         frame_w = frame_h = 0
     fallback_record: dict[str, Any] | None = None
+    concept_error: HTTPException | None = None
     for idx, cand in enumerate(candidates):
         prompt = str(cand.get("prompt", "")).strip()
         if not prompt:
             continue
-        attempt = await call_sam_concept_with_fallback(
-            image_path,
-            [prompt],
-            job_dir / f"mask-{job_id}-{idx}.png",
-            single_frame=call_sam_3_1_single_frame,
-        )
-        if fallback_record is None:
-            fallback_record = attempt
-        if attempt.get("match"):
-            return attempt, idx
+        try:
+            attempt = await call_sam_concept_with_fallback(
+                image_path,
+                [prompt],
+                job_dir / f"mask-{job_id}-{idx}.png",
+                single_frame=call_sam_3_1_single_frame,
+            )
+        except HTTPException as exc:
+            # The concept chain could not run at all (e.g. live SAM
+            # unavailable on a keyless deployment). The candidate's
+            # click attempt below probes the CreditShield cache before
+            # any live call, so it still gets its chance; the error is
+            # re-raised at the end if no candidate produced a record.
+            if concept_error is None:
+                concept_error = exc
+            attempt = None
+        if attempt is not None:
+            if fallback_record is None:
+                fallback_record = attempt
+            if attempt.get("match"):
+                return attempt, idx
         point = cand.get("point")
         if isinstance(point, dict) and frame_w and frame_h:
             try:
@@ -2004,6 +2255,8 @@ async def _segment_auto_candidates(
             ):
                 return patt, idx
     if fallback_record is None:
+        if concept_error is not None:
+            raise concept_error
         raise HTTPException(
             status_code=502, detail="Auto-discovery produced no usable candidates."
         )

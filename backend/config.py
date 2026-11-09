@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -178,6 +179,26 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def resolve_public_rate_limit_per_hour() -> int:
+    """Live-request quota per client IP per hour for public deployments.
+
+    Read from the ``PUBLIC_RATE_LIMIT_PER_HOUR`` *environment variable
+    only* (never from ``backend/.env``): the limiter in ``main.py`` is
+    active only when the variable is present and parses to a positive
+    integer. Unset, malformed, or non-positive values return ``0``,
+    which disables limiting entirely -- local development and the test
+    suite therefore run exactly as before.
+    """
+    raw = os.environ.get("PUBLIC_RATE_LIMIT_PER_HOUR")
+    if raw is None:
+        return 0
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
 
 
 def _utcnow_iso() -> str:

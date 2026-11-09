@@ -506,9 +506,26 @@ async def call_meta_chat(
         credit_shield.save_response(key, ENDPOINT, "meta-mock", mock, 0.0)
         return mock
 
-    # Resolves (provider, base_url, model) or raises 503/500 before any
-    # request when the selected live provider has no key configured.
-    provider, base_url, server_model = settings.resolve_chat_target()
+    # Resolves (provider, base_url, model) for the live call. A
+    # resolution failure (503/500: no key configured, disallowed model)
+    # is deferred until after the cache probe: a pre-warmed response
+    # needs no provider at all, which is what lets the built-in sample
+    # flows serve on a public deployment whose live keys are omitted.
+    # On a cache miss the deferred error is re-raised unchanged, so an
+    # uncached request still fails exactly as before.
+    try:
+        provider, base_url, server_model = settings.resolve_chat_target()
+        target_error: HTTPException | None = None
+    except HTTPException as exc:
+        target_error = exc
+        provider = settings.CHAT_PROVIDER
+        base_url = ""
+        if provider == "baseten":
+            server_model = BASETEN_CHAT_MODEL_REQUIRED
+        elif provider == "meta":
+            server_model = settings.META_CHAT_MODEL_ID or META_CHAT_MODEL_DEFAULT
+        else:
+            server_model = META_CHAT_MODEL_DEFAULT
     effective_system = build_system_prompt(
         system_prompt, jurisdiction_code, use_prefix_cache
     )
@@ -526,6 +543,8 @@ async def call_meta_chat(
         ):
             return cached["result"]
         return cached
+    if target_error is not None:
+        raise target_error
 
     # Conservative pre-call estimate from the input size and the output
     # cap; the request is rejected when it cannot fit the app budget. The
@@ -3314,9 +3333,15 @@ async def call_sam_concept_with_fallback(
     denotes the caller's defect. When nothing matches, the primary
     phrase's own no-match record is returned, so the reported prompt
     and outcome always reflect the caller's phrase.
-    Provider errors (HTTPException) propagate: a failed call is not a
-    no-match, and callers that can degrade per item (the walkthrough
-    route) guard for it themselves.
+    Provider errors with status 502/503 (upstream failure, provider
+    not configured, or the offline demo lock) mark only that phrase's
+    attempt as unavailable and the chain continues: a later phrase may
+    still be served from the CreditShield cache, which is what lets
+    pre-warmed sample flows complete on a deployment whose live keys
+    are omitted or rate-limited. If no phrase produced a record at
+    all, the first such error is re-raised, so a caller whose phrases
+    are all uncached still fails clearly. Budget rejections (402/429
+    from the CreditShield caps) always propagate immediately.
     """
     candidates: list[str] = []
     for phrase in phrases:
@@ -3342,8 +3367,21 @@ async def call_sam_concept_with_fallback(
     sam_call = single_frame or call_sam_3_1_single_frame
     first_miss: dict[str, Any] | None = None
     loose_match: dict[str, Any] | None = None
+    first_unavailable: HTTPException | None = None
     for phrase in attempts:
-        record = await sam_call(frame_path, phrase, out_path)
+        try:
+            record = await sam_call(frame_path, phrase, out_path)
+        except HTTPException as exc:
+            if exc.status_code not in (502, 503):
+                raise
+            # This phrase's live call could not be attempted at all
+            # (provider down, not configured, or offline-locked). A
+            # later phrase may still hit the CreditShield cache, so
+            # the chain continues; the error is re-raised at the end
+            # only when no phrase produced any record.
+            if first_unavailable is None:
+                first_unavailable = exc
+            continue
         if record.get("match"):
             if (
                 phrase.lower() in _OVER_GENERIC_FALLBACK_WORDS
@@ -3368,6 +3406,10 @@ async def call_sam_concept_with_fallback(
             first_miss = record
     if loose_match is not None:
         return loose_match
+    if first_miss is None and first_unavailable is not None:
+        # Every attempt was unavailable and nothing was cached: fail
+        # with the provider error rather than a fabricated no-match.
+        raise first_unavailable
     assert first_miss is not None  # attempts is never empty
     return first_miss
 
