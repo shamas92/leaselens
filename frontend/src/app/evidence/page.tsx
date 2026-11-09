@@ -1755,6 +1755,9 @@ export default function EvidencePage() {
                 </label>
               )}
             </div>
+            <p className="kg-privacy-badge">
+              🔒 Privacy-first: Statutory math and quote verification run locally in Python. Uploaded files are never used for model training.
+            </p>
             <div
               className="kg-quick-strip"
               aria-label="Curated dorm test photos"

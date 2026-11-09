@@ -4512,3 +4512,38 @@ ul.kg-model-badges, ol.kg-model-badges { list-style: none; margin: 0; padding: 0
   max-height: none;
 }
 .kg-pair-stage .kg-stage-overlay-img { object-fit: contain; }
+
+/* ---- Production shell cleanup: header dossier action, quick-try
+   label, architecture accordion, privacy badges ----
+   Final layout word for the production pass. The header's primary
+   action is the Master Dossier export (espresso .kg-btn--dossier,
+   sized here for the header since its old demo-bar sizing rule no
+   longer applies); the preset bar label reads as written, not in
+   the old all-caps preset style; the Architecture X-Ray content
+   lives on in a collapsed <details> accordion at the bottom of the
+   page; and the Step 1 / Step 2 upload cards carry a quiet
+   privacy note. */
+.kg-header-right .kg-btn--dossier { padding: 8px 14px; font-size: 13px; }
+.kg-header-right .kg-dossier-export { margin-left: 0; }
+.kg-demo-label { text-transform: none; letter-spacing: 0.01em; font-size: 12.5px; }
+.kg-arch { max-width: 1240px; margin: 4px auto 28px; padding: 0 24px; }
+.kg-arch-summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #625C54;
+  padding: 8px 2px;
+  width: fit-content;
+}
+.kg-arch-summary:hover { color: #181615; }
+.kg-arch-body { margin-top: 8px; }
+.kg-privacy-badge {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border: 1px solid #E2DDD3;
+  border-radius: 10px;
+  background: #F7F4EE;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: #625C54;
+}

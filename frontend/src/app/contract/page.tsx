@@ -969,9 +969,12 @@ export default function ContractPage() {
               disabled={demoPdfLoading}
               onClick={onAttachSamplePdf}
             >
-              <Sparkles size={14} aria-hidden="true" /> Attach Sample PDF ($0.00)
+              <Sparkles size={14} aria-hidden="true" /> Try Sample Dorm Contract
             </button>
           </div>
+          <p className="kg-privacy-badge">
+            🔒 Privacy-first: Statutory math and quote verification run locally in Python. Uploaded files are never used for model training.
+          </p>
           {demoPdfError && (
             <p role="alert" className="kg-alert kg-alert--error">
               {demoPdfError}
@@ -987,7 +990,7 @@ export default function ContractPage() {
           </button>
           {!file && (
             <p className="kg-cta-hint">
-              Attach a PDF or click a Demo Preset above to enable
+              Attach a PDF or click an Example Case above to enable
             </p>
           )}
           {decodeError && (
